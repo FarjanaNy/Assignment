@@ -1,2 +1,2 @@
-# Assignmnet
+# Assignment
 Scenario based assignment
