@@ -1,0 +1,597 @@
+For an interview or architecture exercise like this, I'd avoid generating a single huge `main.tf`. A better answer is to present a production-grade module repository structure that is:
+
+* Reusable across QA/PreProd/Prod
+* Private-by-default
+* Shared VPC compatible
+* Least-privilege IAM
+* Workload Identity enabled
+* Cloud SQL Private IP ready
+* Encrypted and audited storage
+* Versioned and reviewable
+* Suitable for GitHub + CI/CD promotion
+
+---
+
+# Repository Structure
+
+```text
+terraform-gcp-gke-service-project/
+│
+├── modules/
+│   └── service-project/
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── versions.tf
+│       ├── locals.tf
+│       └── README.md
+│
+├── environments/
+│   ├── qa/
+│   │   ├── backend.tf
+│   │   ├── main.tf
+│   │   └── terraform.tfvars
+│   │
+│   ├── preprod/
+│   │   ├── backend.tf
+│   │   ├── main.tf
+│   │   └── terraform.tfvars
+│   │
+│   └── prod/
+│       ├── backend.tf
+│       ├── main.tf
+│       └── terraform.tfvars
+│
+├── .github/
+│   └── workflows/
+│       ├── terraform-plan.yml
+│       └── terraform-apply.yml
+│
+├── .gitignore
+├── README.md
+└── CODEOWNERS
+```
+
+---
+
+# versions.tf
+
+```terraform
+terraform {
+  required_version = ">= 1.8.0"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
+
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 6.0"
+    }
+  }
+}
+```
+
+---
+
+# variables.tf
+
+```terraform
+variable "project_id" {
+  type        = string
+  description = "Service project ID"
+}
+
+variable "project_name" {
+  type        = string
+}
+
+variable "billing_account" {
+  type        = string
+}
+
+variable "folder_id" {
+  type        = string
+}
+
+variable "host_project_id" {
+  type        = string
+}
+
+variable "region" {
+  type = string
+
+  validation {
+    condition     = can(regex("^([a-z]+-[a-z]+[0-9])$", var.region))
+    error_message = "Invalid GCP region."
+  }
+}
+
+variable "environment" {
+  type = string
+
+  validation {
+    condition = contains(
+      ["qa","preprod","prod"],
+      var.environment
+    )
+
+    error_message = "Must be qa/preprod/prod."
+  }
+}
+
+variable "labels" {
+  type    = map(string)
+  default = {}
+}
+
+variable "kms_key_id" {
+  type = string
+}
+
+variable "gke_namespace" {
+  type = string
+}
+```
+
+---
+
+# locals.tf
+
+```terraform
+locals {
+
+  common_labels = merge(
+    {
+      managed_by  = "terraform"
+      environment = var.environment
+      platform    = "flowvelly"
+    },
+    var.labels
+  )
+
+  required_apis = [
+    "container.googleapis.com",
+    "compute.googleapis.com",
+    "sqladmin.googleapis.com",
+    "storage.googleapis.com",
+    "servicenetworking.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com"
+  ]
+}
+```
+
+---
+
+# main.tf
+
+## Project Creation
+
+```terraform
+resource "google_project" "service_project" {
+
+  project_id      = var.project_id
+  name            = var.project_name
+  folder_id       = var.folder_id
+  billing_account = var.billing_account
+
+  labels = local.common_labels
+}
+```
+
+---
+
+## Enable APIs
+
+```terraform
+resource "google_project_service" "apis" {
+
+  for_each = toset(local.required_apis)
+
+  project = google_project.service_project.project_id
+  service = each.value
+
+  disable_on_destroy = false
+}
+```
+
+---
+
+## Shared VPC Attachment
+
+```terraform
+resource "google_compute_shared_vpc_service_project" "attachment" {
+
+  host_project    = var.host_project_id
+  service_project = google_project.service_project.project_id
+}
+```
+
+---
+
+## Terraform Service Account
+
+```terraform
+resource "google_service_account" "terraform" {
+
+  account_id   = "terraform-sa"
+  display_name = "Terraform Deployment SA"
+
+  project = google_project.service_project.project_id
+}
+```
+
+---
+
+## Least Privilege IAM
+
+Avoid Editor/Owner.
+
+```terraform
+resource "google_project_iam_member" "sa_roles" {
+
+  for_each = toset([
+    "roles/container.admin",
+    "roles/storage.admin",
+    "roles/cloudsql.client",
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter"
+  ])
+
+  project = google_project.service_project.project_id
+  role    = each.value
+
+  member = "serviceAccount:${google_service_account.terraform.email}"
+}
+```
+
+---
+
+# Workload Identity
+
+```terraform
+resource "google_service_account" "workload" {
+
+  account_id = "app-workload"
+
+  project = google_project.service_project.project_id
+}
+```
+
+```terraform
+resource "google_service_account_iam_binding" "wi" {
+
+  service_account_id =
+  google_service_account.workload.name
+
+  role = "roles/iam.workloadIdentityUser"
+
+  members = [
+    "serviceAccount:${var.project_id}.svc.id.goog[${var.gke_namespace}/app]"
+  ]
+}
+```
+
+---
+
+# Cloud SQL Private Connectivity
+
+Reserved range.
+
+```terraform
+resource "google_compute_global_address" "private_sql" {
+
+  project = google_project.service_project.project_id
+
+  name          = "private-sql-range"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+
+  network = "projects/${var.host_project_id}/global/networks/shared-vpc"
+}
+```
+
+```terraform
+resource "google_service_networking_connection" "private_vpc" {
+
+  network =
+  "projects/${var.host_project_id}/global/networks/shared-vpc"
+
+  service = "servicenetworking.googleapis.com"
+
+  reserved_peering_ranges = [
+    google_compute_global_address.private_sql.name
+  ]
+}
+```
+
+---
+
+# Cloud SQL Instance
+
+Private only.
+
+```terraform
+resource "google_sql_database_instance" "postgres" {
+
+  name             = "${var.environment}-postgres"
+  database_version = "POSTGRES_16"
+
+  region = var.region
+
+  deletion_protection = true
+
+  settings {
+
+    tier = "db-custom-2-8192"
+
+    ip_configuration {
+
+      ipv4_enabled = false
+
+      private_network =
+      "projects/${var.host_project_id}/global/networks/shared-vpc"
+    }
+
+    backup_configuration {
+      enabled = true
+    }
+  }
+
+  depends_on = [
+    google_service_networking_connection.private_vpc
+  ]
+}
+```
+
+---
+
+# Secure Storage Bucket
+
+Requirements:
+
+* CMEK
+* Logging
+* Uniform access
+* Versioning
+
+```terraform
+resource "google_storage_bucket" "app_bucket" {
+
+  name = "${var.project_id}-data"
+
+  location = "US"
+
+  uniform_bucket_level_access = true
+
+  versioning {
+    enabled = true
+  }
+
+  encryption {
+    default_kms_key_name = var.kms_key_id
+  }
+
+  logging {
+    log_bucket        = "${var.project_id}-audit"
+    log_object_prefix = "access"
+  }
+
+  labels = local.common_labels
+}
+```
+
+---
+
+# Outputs
+
+```terraform
+output "project_id" {
+  value = google_project.service_project.project_id
+}
+
+output "terraform_sa" {
+  value = google_service_account.terraform.email
+}
+
+output "workload_identity_sa" {
+  value = google_service_account.workload.email
+}
+
+output "cloudsql_private_ip" {
+  value = google_sql_database_instance.postgres.private_ip_address
+}
+```
+
+---
+
+# Environment Example
+
+## environments/qa/main.tf
+
+```terraform
+module "service_project" {
+
+  source = "../../modules/service-project"
+
+  project_id      = "flowvelly-qa-app01"
+  project_name    = "Flowvelly QA"
+  billing_account = var.billing_account
+  folder_id       = var.folder_id
+
+  host_project_id = "flowvelly-host"
+
+  region = "us-east4"
+
+  environment = "qa"
+
+  kms_key_id =
+  "projects/sec-prj/locations/us/keyRings/main/cryptoKeys/storage"
+
+  gke_namespace = "application"
+}
+```
+
+---
+
+# Remote State
+
+## backend.tf
+
+```terraform
+terraform {
+
+  backend "gcs" {
+
+    bucket = "flowvelly-tf-state"
+
+    prefix = "qa/service-project"
+  }
+}
+```
+
+State bucket:
+
+```terraform
+versioning = true
+
+uniform_bucket_level_access = true
+
+public_access_prevention = "enforced"
+
+retention_policy
+```
+
+---
+
+# GitHub Actions Validation
+
+## terraform-plan.yml
+
+```yaml
+name: Terraform Plan
+
+on:
+  pull_request:
+
+jobs:
+
+  plan:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform fmt -check -recursive
+
+      - run: terraform init
+
+      - run: terraform validate
+
+      - run: terraform plan
+```
+
+---
+
+# Promotion Model
+
+Instead of changing code:
+
+```text
+Feature Branch
+      ↓
+PR Review
+      ↓
+QA Apply
+      ↓
+Integration Testing
+      ↓
+Promote same module version
+      ↓
+PreProd
+      ↓
+CAB Approval
+      ↓
+Prod
+```
+
+Example:
+
+```terraform
+module "service_project" {
+  source = "git::https://github.com/flowvelly/terraform-gke-service-project.git?ref=v1.2.0"
+}
+```
+
+QA:
+
+```text
+v1.2.0
+```
+
+PreProd:
+
+```text
+v1.2.0
+```
+
+Prod:
+
+```text
+v1.2.0
+```
+
+No code drift between environments.
+
+---
+
+## Safe Secret Handling
+
+Never store:
+
+```terraform
+password = "admin123"
+```
+
+Instead:
+
+* Secret Manager for DB credentials.
+* GitHub OIDC → GCP Workload Identity Federation.
+* No service-account keys.
+* Terraform state encrypted in GCS.
+* Sensitive outputs marked:
+
+```terraform
+output "db_password" {
+  sensitive = true
+}
+```
+
+---
+
+## One Important AI-Generated Terraform Issue I'd Flag
+
+Many AI-generated examples grant:
+
+```terraform
+roles/editor
+```
+
+or
+
+```terraform
+roles/owner
+```
+
+to deployment service accounts because it "just works."
+
+For a healthcare workload with PHI-bordering data, this violates least-privilege and typically fails security review. I deliberately used scoped roles (`container.admin`, `cloudsql.client`, `logWriter`, etc.) and would verify them against Flowvelly's IAM matrix before implementation rather than assuming broad access.
